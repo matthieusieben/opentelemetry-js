@@ -66,6 +66,72 @@ export interface StartOutgoingSpanCustomAttributeFunction {
 }
 
 /**
+ * The request/response pair a server metric attributes hook is called with.
+ */
+export interface HttpServerMetricAttributesHookInfo {
+  request: IncomingMessage;
+  response: ServerResponse;
+}
+
+/**
+ * The request/response pair a client metric attributes hook is called with.
+ *
+ * `response` is `undefined` when the metric is recorded for a request that
+ * never produced a response (for example an aborted request, a socket error,
+ * or a DNS failure).
+ */
+export interface HttpClientMetricAttributesHookInfo {
+  request: ClientRequest;
+  response?: IncomingMessage;
+}
+
+/**
+ * Called once per recorded `http.server.request.duration` measurement, right
+ * before it is recorded, with the attributes the instrumentation computed.
+ * Returned attributes are added to that measurement.
+ *
+ * Keys that the instrumentation already computed are **not** overridable: a
+ * returned key that collides with one of them is dropped and a warning is
+ * logged via `diag`. Returning `undefined` (or mutating the passed
+ * `attributes` object, which is a copy) adds nothing.
+ *
+ * > **Keep the returned attributes low cardinality.** Every distinct
+ * > combination of attribute values creates a separate metric time series in
+ * > the backend, and the memory held by the SDK grows with it. Return
+ * > booleans or small closed enums whose value set you control. Never return
+ * > raw header values, user or session IDs, request URLs or paths, query
+ * > parameters, IP addresses, or anything else derived from untrusted input —
+ * > a single such attribute is enough to exhaust the metric cardinality limit
+ * > and make the metric useless.
+ */
+export interface HttpServerMetricCustomAttributeFunction {
+  (
+    attributes: Attributes,
+    info: HttpServerMetricAttributesHookInfo
+  ): Attributes | void;
+}
+
+/**
+ * Called once per recorded `http.client.request.duration` measurement, right
+ * before it is recorded, with the attributes the instrumentation computed.
+ * Returned attributes are added to that measurement.
+ *
+ * Keys that the instrumentation already computed are **not** overridable: a
+ * returned key that collides with one of them is dropped and a warning is
+ * logged via `diag`. Returning `undefined` (or mutating the passed
+ * `attributes` object, which is a copy) adds nothing.
+ *
+ * > **Keep the returned attributes low cardinality.** See
+ * > {@link HttpServerMetricCustomAttributeFunction} for the full warning.
+ */
+export interface HttpClientMetricCustomAttributeFunction {
+  (
+    attributes: Attributes,
+    info: HttpClientMetricAttributesHookInfo
+  ): Attributes | void;
+}
+
+/**
  * Options available for the HTTP instrumentation (see [documentation](https://github.com/open-telemetry/opentelemetry-js/tree/main/experimental/packages/opentelemetry-instrumentation-http#http-instrumentation-options))
  */
 export interface HttpInstrumentationConfig extends InstrumentationConfig {
@@ -87,6 +153,28 @@ export interface HttpInstrumentationConfig extends InstrumentationConfig {
   startIncomingSpanHook?: StartIncomingSpanCustomAttributeFunction;
   /** Function for adding custom attributes before a span is started in outgoingRequest */
   startOutgoingSpanHook?: StartOutgoingSpanCustomAttributeFunction;
+  /**
+   * Function for adding custom attributes to the `http.server.request.duration`
+   * metric, called once per recorded measurement.
+   *
+   * The returned attributes are **added to**, and cannot replace, the
+   * attributes the instrumentation computed. Returned attributes must be low
+   * cardinality; see {@link HttpServerMetricCustomAttributeFunction}.
+   *
+   * @experimental
+   */
+  serverMetricAttributesHook?: HttpServerMetricCustomAttributeFunction;
+  /**
+   * Function for adding custom attributes to the `http.client.request.duration`
+   * metric, called once per recorded measurement.
+   *
+   * The returned attributes are **added to**, and cannot replace, the
+   * attributes the instrumentation computed. Returned attributes must be low
+   * cardinality; see {@link HttpServerMetricCustomAttributeFunction}.
+   *
+   * @experimental
+   */
+  clientMetricAttributesHook?: HttpClientMetricCustomAttributeFunction;
   /**
    * The primary server name of the matched virtual host.
    * @deprecated No longer used. Stable HTTP semantic conventions do not include

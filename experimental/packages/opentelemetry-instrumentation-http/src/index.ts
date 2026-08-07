@@ -5,10 +5,14 @@
 
 export { HttpInstrumentation } from './http';
 export type {
+  HttpClientMetricAttributesHookInfo,
+  HttpClientMetricCustomAttributeFunction,
   HttpCustomAttributeFunction,
   HttpInstrumentationConfig,
   HttpRequestCustomAttributeFunction,
   HttpResponseCustomAttributeFunction,
+  HttpServerMetricAttributesHookInfo,
+  HttpServerMetricCustomAttributeFunction,
   IgnoreIncomingRequestFunction,
   IgnoreOutgoingRequestFunction,
   StartIncomingSpanCustomAttributeFunction,

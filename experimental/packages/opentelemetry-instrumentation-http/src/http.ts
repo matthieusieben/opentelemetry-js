@@ -128,6 +128,50 @@ export class HttpInstrumentation extends InstrumentationBase<HttpInstrumentation
     this._httpClientDurationHistogram.record(durationMs / 1000, attributes);
   }
 
+  /**
+   * Merges the attributes returned by a metric attributes hook over the
+   * attributes the instrumentation computed.
+   *
+   * The hook is additive: keys the instrumentation already computed are
+   * required by the semantic conventions, so a colliding key returned by the
+   * hook is dropped rather than allowed to overwrite. The hook is invoked
+   * through `safeExecuteInTheMiddle` so a throwing hook can neither break the
+   * request nor lose the measurement.
+   */
+  private _callMetricAttributesHook<TInfo>(
+    hook: (attributes: Attributes, info: TInfo) => Attributes | void,
+    attributes: Attributes,
+    info: TInfo
+  ): Attributes {
+    const extraAttributes = safeExecuteInTheMiddle(
+      // Pass a copy so a hook that mutates its argument cannot tamper with the
+      // semconv attributes; only the returned object is considered.
+      () => hook(Object.assign({}, attributes), info),
+      e => {
+        if (e != null) {
+          this._diag.error('caught metric attributes hook error: ', e);
+        }
+      },
+      true
+    );
+
+    if (extraAttributes == null || typeof extraAttributes !== 'object') {
+      return attributes;
+    }
+
+    const merged = Object.assign({}, attributes);
+    for (const key of Object.keys(extraAttributes)) {
+      if (key in attributes) {
+        this._diag.warn(
+          `metric attributes hook returned the reserved attribute '${key}', which is computed by the instrumentation; the returned value was ignored`
+        );
+        continue;
+      }
+      merged[key] = extraAttributes[key];
+    }
+    return merged;
+  }
+
   override setConfig(config: HttpInstrumentationConfig = {}): void {
     super.setConfig(config);
     this._headerCapture = this._createHeaderCapture();
@@ -451,7 +495,9 @@ export class HttpInstrumentation extends InstrumentationBase<HttpInstrumentation
             span,
             SpanKind.CLIENT,
             startTime,
-            metricAttributes
+            metricAttributes,
+            request,
+            response
           );
         };
 
@@ -466,7 +512,9 @@ export class HttpInstrumentation extends InstrumentationBase<HttpInstrumentation
             span,
             metricAttributes,
             startTime,
-            error
+            error,
+            request,
+            response
           );
         });
       }
@@ -477,7 +525,13 @@ export class HttpInstrumentation extends InstrumentationBase<HttpInstrumentation
         return;
       }
       responseFinished = true;
-      this._closeHttpSpan(span, SpanKind.CLIENT, startTime, metricAttributes);
+      this._closeHttpSpan(
+        span,
+        SpanKind.CLIENT,
+        startTime,
+        metricAttributes,
+        request
+      );
     });
     request.on(errorMonitor, (error: Err) => {
       this._diag.debug('outgoingRequest on request error()', error);
@@ -485,7 +539,13 @@ export class HttpInstrumentation extends InstrumentationBase<HttpInstrumentation
         return;
       }
       responseFinished = true;
-      this._onOutgoingRequestError(span, metricAttributes, startTime, error);
+      this._onOutgoingRequestError(
+        span,
+        metricAttributes,
+        startTime,
+        error,
+        request
+      );
     });
 
     this._diag.debug('http.ClientRequest return request');
@@ -619,7 +679,9 @@ export class HttpInstrumentation extends InstrumentationBase<HttpInstrumentation
               span,
               metricAttributes,
               startTime,
-              err
+              err,
+              request,
+              response
             );
           });
 
@@ -631,7 +693,9 @@ export class HttpInstrumentation extends InstrumentationBase<HttpInstrumentation
                   span,
                   metricAttributes,
                   startTime,
-                  error
+                  error,
+                  request,
+                  response
                 );
                 throw error;
               }
@@ -830,31 +894,56 @@ export class HttpInstrumentation extends InstrumentationBase<HttpInstrumentation
       );
     }
 
-    this._closeHttpSpan(span, SpanKind.SERVER, startTime, metricAttributes);
+    this._closeHttpSpan(
+      span,
+      SpanKind.SERVER,
+      startTime,
+      metricAttributes,
+      request,
+      response
+    );
   }
 
   private _onOutgoingRequestError(
     span: Span,
     metricAttributes: Attributes,
     startTime: HrTime,
-    error: Err
+    error: Err,
+    request?: http.ClientRequest,
+    response?: http.IncomingMessage
   ) {
     setSpanWithError(span, error);
     metricAttributes[ATTR_ERROR_TYPE] = error.name;
 
-    this._closeHttpSpan(span, SpanKind.CLIENT, startTime, metricAttributes);
+    this._closeHttpSpan(
+      span,
+      SpanKind.CLIENT,
+      startTime,
+      metricAttributes,
+      request,
+      response
+    );
   }
 
   private _onServerResponseError(
     span: Span,
     metricAttributes: Attributes,
     startTime: HrTime,
-    error: Err
+    error: Err,
+    request?: http.IncomingMessage,
+    response?: http.ServerResponse
   ) {
     setSpanWithError(span, error);
     metricAttributes[ATTR_ERROR_TYPE] = error.name;
 
-    this._closeHttpSpan(span, SpanKind.SERVER, startTime, metricAttributes);
+    this._closeHttpSpan(
+      span,
+      SpanKind.SERVER,
+      startTime,
+      metricAttributes,
+      request,
+      response
+    );
   }
 
   private _startHttpSpan(
@@ -888,11 +977,21 @@ export class HttpInstrumentation extends InstrumentationBase<HttpInstrumentation
     return span;
   }
 
+  /**
+   * Ends the span and records the duration metric.
+   *
+   * `request`/`response` are only used to build the argument of the metric
+   * attributes hooks and are not touched when no hook is configured. They are
+   * passed separately rather than as an object so that the no-hook path
+   * allocates nothing beyond what it did before the hooks existed.
+   */
   private _closeHttpSpan(
     span: Span,
     spanKind: SpanKind,
     startTime: HrTime,
-    metricAttributes: Attributes
+    metricAttributes: Attributes,
+    request?: http.IncomingMessage | http.ClientRequest,
+    response?: http.ServerResponse | http.IncomingMessage
   ) {
     if (!this._spanNotEnded.has(span)) {
       return;
@@ -904,8 +1003,30 @@ export class HttpInstrumentation extends InstrumentationBase<HttpInstrumentation
     // Record metrics
     const duration = hrTimeToMilliseconds(hrTimeDuration(startTime, hrTime()));
     if (spanKind === SpanKind.SERVER) {
+      const hook = this.getConfig().serverMetricAttributesHook;
+      if (hook !== undefined && request !== undefined) {
+        metricAttributes = this._callMetricAttributesHook(
+          hook,
+          metricAttributes,
+          {
+            request: request as http.IncomingMessage,
+            response: response as http.ServerResponse,
+          }
+        );
+      }
       this._recordServerDuration(duration, metricAttributes);
     } else if (spanKind === SpanKind.CLIENT) {
+      const hook = this.getConfig().clientMetricAttributesHook;
+      if (hook !== undefined && request !== undefined) {
+        metricAttributes = this._callMetricAttributesHook(
+          hook,
+          metricAttributes,
+          {
+            request: request as http.ClientRequest,
+            response: response as http.IncomingMessage | undefined,
+          }
+        );
+      }
       this._recordClientDuration(duration, metricAttributes);
     }
   }

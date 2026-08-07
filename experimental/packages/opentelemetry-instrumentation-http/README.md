@@ -57,6 +57,8 @@ Options                                 | Type                                  
 `responseHook`                          | `HttpResponseCustomAttributeFunction`      | Function for adding custom attributes before response is handled
 `startIncomingSpanHook`                 | `StartIncomingSpanCustomAttributeFunction` | Function for adding custom attributes before a span is started in incomingRequest
 `startOutgoingSpanHook`                 | `StartOutgoingSpanCustomAttributeFunction` | Function for adding custom attributes before a span is started in outgoingRequest
+`serverMetricAttributesHook`            | `HttpServerMetricCustomAttributeFunction`  | **Experimental.** Function for adding custom attributes to the `http.server.request.duration` metric. See [Custom metric attributes](#custom-metric-attributes).
+`clientMetricAttributesHook`            | `HttpClientMetricCustomAttributeFunction`  | **Experimental.** Function for adding custom attributes to the `http.client.request.duration` metric. See [Custom metric attributes](#custom-metric-attributes).
 `ignoreIncomingRequestHook`             | `IgnoreIncomingRequestFunction`            | Function for filtering incoming requests. HTTP instrumentation will not trace incoming requests for which the function returns `true`.
 `ignoreOutgoingRequestHook`             | `IgnoreOutgoingRequestFunction`            | Function for filtering outgoing requests. HTTP instrumentation will not trace outgoing requests for which the function returns `true`.
 `disableOutgoingRequestInstrumentation` | `boolean`                                  | Set to true to avoid instrumenting outgoing requests at all. This can be helpful when another instrumentation handles outgoing requests.
@@ -77,6 +79,79 @@ Hook type                                  | Parameters                         
 `StartIncomingSpanCustomAttributeFunction` | `request: IncomingMessage`                                                                                   | `Attributes` to add before the incoming request span starts
 `StartOutgoingSpanCustomAttributeFunction` | `request: RequestOptions`                                                                                    | `Attributes` to add before the outgoing request span starts
 `HttpCustomAttributeFunction`              | `span: Span`, `request: ClientRequest` or `IncomingMessage`, `response: IncomingMessage` or `ServerResponse` | `void`
+`HttpServerMetricCustomAttributeFunction`  | `attributes: Attributes`, `info: { request: IncomingMessage, response: ServerResponse }`                     | `Attributes` to add to the server duration metric, or `undefined`
+`HttpClientMetricCustomAttributeFunction`  | `attributes: Attributes`, `info: { request: ClientRequest, response?: IncomingMessage }`                     | `Attributes` to add to the client duration metric, or `undefined`
+
+### Custom metric attributes
+
+> [!WARNING]
+> **Keep the returned attributes low cardinality.** Every distinct combination
+> of attribute values creates a separate time series in your metrics backend,
+> and a separate accumulator held in memory by the SDK. Returning an unbounded
+> value is the single easiest way to exhaust the SDK's cardinality limit (2000
+> attribute sets per instrument by default), at which point further attribute
+> sets are folded into an overflow series and your metric becomes useless.
+>
+> Return booleans or small closed enums whose value set you control. **Never**
+> return raw header values, user or session IDs, request URLs or paths, query
+> parameters, IP addresses, or anything else derived from untrusted input. In
+> particular, do **not** return `url.path` or `url.full` — a public endpoint
+> receiving arbitrary paths will generate a new series per unique path. If you
+> want a route dimension, emit a low-cardinality `http.route` instead, which
+> the instrumentation already picks up from the framework instrumentation via
+> `RPCMetadata`.
+
+`serverMetricAttributesHook` and `clientMetricAttributesHook` are called once
+per recorded measurement, immediately before the duration histogram is
+recorded. At that point the response is complete, so the status code and route
+are already known and are visible in the `attributes` argument.
+
+The hooks are **additive**: the returned attributes are merged *over* the
+attributes the instrumentation computed, and a returned key that collides with
+one of those is dropped with a warning logged through `diag`. This keeps the
+semantic-convention attributes required by the spec from being silently
+removed or rewritten. The `attributes` object passed to the hook is a copy;
+mutating it has no effect, only the return value is used.
+
+Returning `undefined` (or nothing at all) adds nothing. A hook that throws is
+contained: the error is logged through `diag`, the request proceeds normally,
+and the measurement is still recorded with the computed attributes.
+
+The example below splits inbound request metrics by a boolean derived from a
+custom request header, so that dashboards and alerts can separate two classes
+of traffic that are otherwise identical across every semantic-convention
+attribute. Note that the *presence* of the header is recorded as a boolean —
+the header's value is never used as an attribute value.
+
+```js
+const { HttpInstrumentation } = require('@opentelemetry/instrumentation-http');
+
+// A closed set of known dependencies. Anything unrecognized collapses into a
+// single 'other' bucket, which keeps the cardinality bounded no matter what
+// host the request is made to.
+const KNOWN_DEPENDENCIES = new Set(['billing.internal', 'search.internal']);
+
+const httpInstrumentation = new HttpInstrumentation({
+  serverMetricAttributesHook: (attributes, { request, response }) => {
+    return {
+      // Low cardinality: exactly two values. The header's value is compared,
+      // never used as the attribute value.
+      'acme.privileged_client': request.headers['x-acme-privileged'] === '1',
+    };
+  },
+  clientMetricAttributesHook: (attributes, { request, response }) => {
+    return {
+      'acme.dependency': KNOWN_DEPENDENCIES.has(request.host)
+        ? request.host
+        : 'other',
+    };
+  },
+});
+```
+
+For the client hook, `info.response` is `undefined` when the metric is recorded
+for a request that never produced a response — for example an aborted request,
+a socket error, or a DNS failure. Guard on it before dereferencing.
 
 ## Semantic Conventions
 

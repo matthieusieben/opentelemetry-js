@@ -13,6 +13,8 @@ For notes on migrating to 2.x / 0.200.x see [the upgrade guide](doc/upgrade-to-2
 ### :rocket: Features
 
 * feat(sdk-logs): deprecate `SdkLogRecord` in favor of `ReadWriteLogRecord` [#6939](https://github.com/open-telemetry/opentelemetry-js/pull/6939) @pichlermarc
+* feat(instrumentation-http): add experimental `serverMetricAttributesHook` and `clientMetricAttributesHook` config options for adding custom attributes to the `http.server.request.duration` and `http.client.request.duration` metrics [#5135](https://github.com/open-telemetry/opentelemetry-js/issues/5135) @matthieusieben
+  * Returned attributes are added to, and cannot replace, the attributes computed by the instrumentation. Returned attributes must be low cardinality; see the package README for details.
 
 ### :bug: Bug Fixes
 
